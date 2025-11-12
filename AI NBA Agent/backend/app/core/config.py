@@ -1,1 +1,1 @@
-// settings from .env
+# settings from .env
