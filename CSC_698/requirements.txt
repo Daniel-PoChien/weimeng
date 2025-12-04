@@ -1,0 +1,9 @@
+streamlit
+pandas
+nba_api
+langchain
+langchain-community
+langchain-huggingface
+langchain-groq
+chromadb
+sentence-transformers

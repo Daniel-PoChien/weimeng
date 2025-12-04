@@ -1,1 +1,0 @@
-# FAISS/Chroma index ops 
