@@ -12,3 +12,4 @@ chromadb>=0.5.0
 pydantic-settings
 sentence-transformers
 tabulate
+requests

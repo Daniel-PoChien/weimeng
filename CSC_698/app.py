@@ -1,91 +1,201 @@
 import streamlit as st
 import pandas as pd
+from datetime import datetime
+
 from langchain_groq import ChatGroq
 from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe_agent
 from langchain_classic.chains import RetrievalQA
 from langchain_core.prompts import PromptTemplate
-from rag_engine import get_retriever
-import os
 
-# Import Groq errors for better error handling
+from rag_engine import get_retriever
+from live_stats import (
+    get_player_season_average,
+    format_season_average_human,
+    LiveStatsError,
+)
+
+# Import Groq errors (used in some error handling logic)
 try:
     from groq import APIConnectionError, APIError
 except ImportError:
     APIConnectionError = Exception
     APIError = Exception
 
-# Page Setup
+
+# --------------------------------------------------------
+# 1. STREAMLIT PAGE CONFIG
+# --------------------------------------------------------
 st.set_page_config(page_title="NBA AI Analyst", page_icon="🏀")
 st.title("🏀 NBA Stats Agent")
 
-# Sidebar for API Key and Mode Selection
+
+# --------------------------------------------------------
+# 2. SIDEBAR
+# --------------------------------------------------------
 with st.sidebar:
     st.header("Settings")
     api_key = st.text_input("Enter Groq API Key:", type="password")
     st.markdown("[Get a Free Key Here](https://console.groq.com/keys)")
-    
+
     st.divider()
     st.header("Query Mode")
-    # Mode selector: Auto (smart fallback), Pandas Agent, or RAG
     mode = st.radio(
         "Choose query mode:",
         ["Auto (Smart)", "Pandas Agent", "RAG"],
-        help="Auto: Tries Pandas Agent first, falls back to RAG on token/connection/parsing errors (if available)."
+        help="Auto: Live API + RAG for general questions, Pandas for stats-heavy questions.",
     )
-    
-    if mode == "Auto (Smart)":
-        st.info("Will try Pandas Agent first, then RAG if needed and available.")
-    elif mode == "Pandas Agent":
-        st.info("Best for complex calculations over the CSV stats.")
-    else:
-        st.info("Best for semantic search over the CSV content (with general NBA knowledge).")
 
+    if mode == "Auto (Smart)":
+        st.info("Auto: Live API for 'this season' stats, RAG for concepts, Pandas for CSV stats.")
+    elif mode == "Pandas Agent":
+        st.info("Best for detailed calculations on the CSV stats.")
+    else:
+        st.info("Best for semantic search + general NBA knowledge.")
+
+
+# --------------------------------------------------------
+# 3. CACHE DATA FOR SPEED
+# --------------------------------------------------------
+@st.cache_data
+def load_data():
+    df_teams = pd.read_csv("nba_teams.csv")
+    df_rosters = pd.read_csv("nba_rosters.csv")
+    df_scores = pd.read_csv("nba_scores.csv")
+    return df_teams, df_rosters, df_scores
+
+
+# --------------------------------------------------------
+# 4. QUESTION CLASSIFIERS (for Auto routing)
+# --------------------------------------------------------
+def is_beginner_question(q: str) -> bool:
+    """Heuristic: sounds like a general / conceptual / beginner question?"""
+    q = q.lower()
+
+    beginner_phrases = [
+        "who is", "what is", "explain", "tell me", "why",
+        "best player", "good", "bad", "compare", "how good",
+        "how tall", "who won", "history", "summary",
+        "i don't know anything about basketball",
+        "i dont know anything about basketball",
+        "i don't know anything about the nba",
+        "i dont know anything about the nba",
+        "i know nothing about basketball",
+        "i know nothing about the nba",
+        "i'm new to basketball",
+        "im new to basketball",
+        "i'm new to the nba",
+        "im new to the nba",
+        "explain basketball",
+        "explain the nba",
+    ]
+    if any(b in q for b in beginner_phrases):
+        return True
+
+    # If no stats keywords appear → assume conceptual question
+    stats_keywords = [
+        "pts", "points", "reb", "rebounds", "ast", "assists",
+        "ppg", "apg", "rpg", "average", "mean", "median",
+        "sum", "total", "max", "min", "highest", "lowest",
+        "per game", "field goal", "3pt", "3-point", "efficiency", "stat", "stats",
+    ]
+    if not any(k in q for k in stats_keywords):
+        return True
+
+    return False
+
+
+def looks_like_live_stats_question(q: str) -> bool:
+    """
+    Heuristic: questions about what someone is averaging *this season* / now.
+    These should try the live API first.
+    """
+    q = q.lower()
+    triggers = [
+        "this season",
+        "current season",
+        "right now",
+        "currently averaging",
+        "average this year",
+        "averaging this year",
+        "stats this season",
+        "averaging this season",
+        "this year stats",
+        "this year average",
+    ]
+    return any(t in q for t in triggers)
+
+
+def extract_player_name_simple(q: str) -> str:
+    """
+    Very simple heuristic to detect player name in the question.
+    For demo: if it mentions 'curry', 'lebron', etc.
+    You can extend this later.
+    """
+    q_lower = q.lower()
+    if "curry" in q_lower:
+        return "Stephen Curry"
+    if "lebron" in q_lower or "lebron james" in q_lower:
+        return "LeBron James"
+    if "giannis" in q_lower:
+        return "Giannis Antetokounmpo"
+    if "jokic" in q_lower or "jokić" in q_lower:
+        return "Nikola Jokic"
+    # Fallback: return empty string (unknown)
+    return ""
+
+
+# --------------------------------------------------------
+# 5. MAIN APP LOGIC
+# --------------------------------------------------------
 if api_key:
-    # Load Data (If files exist)
     try:
-        df_teams = pd.read_csv("nba_teams.csv")
-        df_rosters = pd.read_csv("nba_rosters.csv")
-        df_scores = pd.read_csv("nba_scores.csv")
-        
-        # Setup the Groq "Instant" AI Model
+        # Load data once (cached by Streamlit)
+        df_teams, df_rosters, df_scores = load_data()
+
+        # --------------------------------------------------------
+        # 6. LLM SETUP
+        # --------------------------------------------------------
         llm = ChatGroq(
-            temperature=0, 
+            temperature=0,
             model_name="llama-3.1-8b-instant",
-            groq_api_key=api_key
+            groq_api_key=api_key,
         )
 
-        # Initialize both systems
-
-        # Pandas Agent (for complex queries, calculations)
+        # --------------------------------------------------------
+        # 7. PANDAS AGENT (for stats / calculations)
+        # --------------------------------------------------------
         pandas_agent = create_pandas_dataframe_agent(
             llm,
             [df_teams, df_rosters, df_scores],
-            verbose=True,
+            verbose=False,                  # less logging for speed
             allow_dangerous_code=True,
-            agent_executor_kwargs={"handle_parsing_errors": True},
-            number_of_head_rows=3,  # Only show first 3 rows in prompt to reduce token usage
+            agent_executor_kwargs={
+                "handle_parsing_errors": True,  # let it recover from weird outputs
+            },
+            number_of_head_rows=3,
         )
-        
-        # RAG System (for semantic search + general NBA knowledge)
+
+        # --------------------------------------------------------
+        # 8. RAG SYSTEM (Chroma + NBA CSVs + general NBA knowledge)
+        # --------------------------------------------------------
         try:
             retriever = get_retriever()
 
-            # Hybrid RAG prompt: use context when helpful, otherwise use general NBA knowledge
-            prompt_template = """
-You are an NBA analyst. You have two sources of information:
+            rag_prompt = """
+You are an expert NBA analyst and teacher. The user might be a beginner.
 
+You have two sources of information:
 1. Retrieved context from a local NBA stats database (teams, rosters, box scores, game results).
 2. Your own general basketball knowledge about players, teams, awards, and history.
 
 Use the context if it clearly contains relevant stats or facts.
-If the context is missing, incomplete, or not directly related to the question,
-you may also use your general NBA knowledge and reasonable judgment to answer.
+If the context is missing or incomplete, you may also use your general NBA knowledge.
 
-If part of your answer is based mainly on general knowledge rather than the context,
-briefly say so (for example: "Based on general NBA knowledge...").
+If part of your answer is mainly based on general knowledge, briefly say so
+(for example: "Based on general NBA knowledge...").
 
-If the question is extremely subjective or impossible to answer precisely,
-explain the uncertainty but still give your best, well-reasoned answer.
+Explain things clearly. If the question sounds like it's from a beginner,
+avoid heavy jargon or explain any basketball terms you use.
 
 Context:
 {context}
@@ -93,10 +203,11 @@ Context:
 Question:
 {question}
 
-Answer (2–4 sentences, clear and conversational):
+Answer (2–5 sentences, clear and conversational):
 """
             PROMPT = PromptTemplate(
-                template=prompt_template, input_variables=["context", "question"]
+                template=rag_prompt,
+                input_variables=["context", "question"],
             )
 
             rag_chain = RetrievalQA.from_chain_type(
@@ -104,174 +215,133 @@ Answer (2–4 sentences, clear and conversational):
                 chain_type="stuff",
                 retriever=retriever,
                 chain_type_kwargs={"prompt": PROMPT},
-                return_source_documents=False
+                return_source_documents=False,
             )
             rag_available = True
         except Exception as e:
-            st.sidebar.warning(
-                "RAG not available (Chroma retriever failed):\n"
+            st.sidebar.error(
+                "RAG not available:\n"
                 f"{e}\n\n"
-                "The app will still work using the Pandas Agent only.\n"
-                "If this mentions chroma or pydantic, try rebuilding the DB or adjusting versions."
+                "Make sure you built the database with:\n"
+                'python -c "from rag_engine import build_database; build_database()"'
             )
             rag_available = False
             rag_chain = None
 
-        # Chat Interface
+        # --------------------------------------------------------
+        # 9. CHAT HISTORY
+        # --------------------------------------------------------
         if "messages" not in st.session_state:
             st.session_state.messages = []
 
-        # Render previous messages
-        for message in st.session_state.messages:
-            with st.chat_message(message["role"]):
-                st.markdown(message["content"])
+        for m in st.session_state.messages:
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
 
-        # New user input
-        if prompt := st.chat_input("Ex: Which team has the most wins?"):
+        # --------------------------------------------------------
+        # 10. HANDLE USER INPUT
+        # --------------------------------------------------------
+        if prompt := st.chat_input("Ask about NBA players, teams, or stats..."):
             st.session_state.messages.append({"role": "user", "content": prompt})
             with st.chat_message("user"):
                 st.markdown(prompt)
 
-            with st.chat_message("assistant"):
-                answer = None
-                used_mode = None
-                error_occurred = False
-                
-                # Determine which systems to consider
-                use_pandas = (mode == "Pandas Agent" or mode == "Auto (Smart)")
-                # Only use RAG by default if user explicitly picked RAG.
-                # Auto mode may switch to RAG later if needed and available.
-                use_rag = (mode == "RAG")
-                
-                # --- 1) Try Pandas Agent first (Auto or Pandas Agent mode) ---
-                if use_pandas and not use_rag:
-                    with st.spinner("Using Pandas Agent..."):
+            answer = None
+            used_mode = None
+
+            # ------------------ 10.1 Live stats path ------------------
+            live_used = False
+            if looks_like_live_stats_question(prompt):
+                player_name = extract_player_name_simple(prompt)
+                if player_name:
+                    # current season 
+                    current_year = datetime.now().year
+                    season = current_year - 1
+
+                    try:
+                        stats, err = get_player_season_average(player_name, season)
+                        if err:
+                            answer = err
+                            used_mode = "Live API (error)"
+                        else:
+                            answer = format_season_average_human(stats)
+                            used_mode = "Live API"
+                        live_used = True
+                    except LiveStatsError as e:
+                        # Gracefully handle auth / network errors instead of crashing
+                        answer = (
+                            "Live NBA stats are currently unavailable.\n\n"
+                            f"{e}\n\n"
+                            "The app will still work using the CSV data (Pandas / RAG)."
+                        )
+                        used_mode = "Live API (unavailable)"
+                        live_used = True
+                # If we couldn't detect a player name, we just fall through to RAG/Pandas
+
+            # ------------------ 10.2 Pandas / RAG routing ------------------
+            if not live_used:
+                # Auto mode routing
+                auto_beginner = is_beginner_question(prompt)
+                auto_use_rag = (mode == "Auto (Smart)") and auto_beginner
+                auto_use_pandas = (mode == "Auto (Smart)") and not auto_beginner
+
+                # Explicit modes
+                force_pandas = (mode == "Pandas Agent")
+                force_rag = (mode == "RAG")
+
+                # -------- Try Pandas Agent (if chosen) --------
+                if force_pandas or auto_use_pandas:
+                    with st.spinner("Using Pandas Agent (dataframe reasoning)..."):
                         try:
                             response = pandas_agent.invoke(prompt)
                             answer = response["output"]
                             used_mode = "Pandas Agent"
-                        except Exception as e:
-                            error_msg = str(e)
-                            error_type = type(e).__name__
-                            
-                            # Check if it's a token/context/rate-limit error
-                            if (
-                                "413" in error_msg
-                                or "token" in error_msg.lower()
-                                or "context length" in error_msg.lower()
-                                or "rate_limit" in error_msg.lower()
-                            ):
-                                if rag_available:
-                                    error_occurred = True
-                                    st.warning("Token/context limit reached! Auto-switching to RAG mode...")
-                                    use_rag = True  # Fallback to RAG
-                                else:
-                                    st.warning(
-                                        "Token/context limit reached, but RAG is not available.\n"
-                                        "Try simplifying your question or narrowing the scope."
-                                    )
-                                    answer = None
-                            # Check if it's a connection error
-                            elif (
-                                isinstance(e, APIConnectionError)
-                                or "APIConnectionError" in error_type
-                                or "Connection" in error_type
-                                or "connection" in error_msg.lower()
-                            ):
-                                error_occurred = True
-                                st.warning(
-                                    "Groq API connection error. This could be due to:\n"
-                                    "- Network connectivity issues\n"
-                                    "- Groq API being temporarily unavailable\n"
-                                    "- API key issues\n\n"
-                                    "Auto-switching to RAG mode (if available)..."
-                                )
-                                if rag_available:
-                                    use_rag = True  # Fallback to RAG
-                                else:
-                                    st.error(
-                                        f"Connection Error: {error_msg}\n\n"
-                                        "Please check your internet connection and Groq API status."
-                                    )
-                                    answer = None
-                            else:
-                                # Special case: LangChain OUTPUT_PARSING_FAILURE from the Pandas Agent
-                                if (
-                                    "OUTPUT_PARSING_FAILURE" in error_msg
-                                    or "output parsing error occurred" in error_msg.lower()
-                                ):
-                                    error_occurred = True
-                                    st.warning(
-                                        "The Pandas stats agent got confused while parsing its own output.\n"
-                                        "I'll try answering using the RAG (semantic search) mode instead."
-                                    )
-                                    if rag_available:
-                                        use_rag = True  # we'll hit the RAG block next
-                                    else:
-                                        st.error(
-                                            "Both the Pandas Agent and RAG are having trouble with this question.\n"
-                                            "Try asking something more specific about stats in the dataset."
-                                        )
-                                        answer = None
-                                else:
-                                    # For other errors, show a short message
-                                    st.error(
-                                        "Error in Pandas Agent. "
-                                        "Try rephrasing or narrowing your question."
-                                    )
-                                    # Uncomment below if you want the raw error in the UI:
-                                    # st.text(error_msg)
-                                    answer = None
-                
-                # --- 2) Use RAG (either explicitly selected or as fallback) ---
-                if use_rag and rag_available:
-                    with st.spinner("Using RAG (semantic search over CSV data + NBA knowledge)..."):
+                        except Exception:
+                            st.warning(
+                                "Pandas Agent had an issue. "
+                                "Switching to RAG (semantic search + knowledge) if available."
+                            )
+                            # If Pandas fails, we fall back to RAG if possible
+                            force_rag = True
+
+                # -------- Try RAG (if chosen / fallback) --------
+                if (force_rag or auto_use_rag) and rag_available and answer is None:
+                    with st.spinner("Using RAG (semantic search + NBA knowledge)..."):
                         try:
-                            # RetrievalQA default input key is "query"
                             response = rag_chain.invoke({"query": prompt})
                             answer = response["result"]
-                            used_mode = (
-                                "RAG"
-                                if not error_occurred
-                                else "RAG (Auto-fallback from Pandas Agent)"
-                            )
+                            if used_mode == "Pandas Agent":
+                                used_mode = "RAG (fallback from Pandas)"
+                            elif mode == "Auto (Smart)" and auto_beginner:
+                                used_mode = "RAG (Auto - beginner/concept question)"
+                            else:
+                                used_mode = "RAG"
                         except Exception as e:
                             st.error(f"RAG Error: {e}")
-                            answer = None
-                elif use_rag and not rag_available:
-                    # User explicitly chose RAG, but it's not available.
-                    # Fall back to Pandas Agent instead of just erroring.
-                    with st.spinner("RAG not available. Using Pandas Agent instead..."):
-                        try:
-                            response = pandas_agent.invoke(prompt)
-                            answer = response["output"]
-                            used_mode = "Pandas Agent (RAG unavailable)"
-                        except Exception as e:
-                            st.error(f"RAG not available and Pandas Agent failed: {e}")
-                            answer = None
-                
-                # --- 3) Display the answer ---
+
+            # ------------------ 10.3 Display answer ------------------
+            with st.chat_message("assistant"):
                 if answer:
-                    # Show which mode was used
                     if used_mode is None:
-                        mode_badge = "🤖"
+                        badge = "🤖"
                         used_mode = "Unknown"
                     else:
-                        mode_badge = (
-                            "🤖" if "Auto" in used_mode
-                            else "📊" if "Pandas" in used_mode
-                            else "🔍"
-                        )
-                    st.caption(f"{mode_badge} Mode: {used_mode}")
+                        if "Live API" in used_mode:
+                            badge = "🌐"
+                        elif "Pandas" in used_mode:
+                            badge = "📊"
+                        else:
+                            badge = "🔍"
+                    st.caption(f"{badge} Mode: {used_mode}")
                     st.markdown(answer)
                     st.session_state.messages.append(
                         {"role": "assistant", "content": answer}
                     )
-                elif not error_occurred:
-                    st.error("Failed to get an answer. Please try again.")
+                else:
+                    st.error("Failed to get an answer. Try rephrasing the question.")
 
     except FileNotFoundError:
-        st.error("CSV files not found! Please run 'python get_data.py' first.")
+        st.error("CSV files missing! Please run 'python get_data.py' first.")
 else:
-    st.info("Please enter your API Key to start.")
+    st.info("Please enter your Groq API Key in the sidebar to start.")
 
